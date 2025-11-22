@@ -1,0 +1,176 @@
+--- a/src/diffusers/models/attention_processor.py
++++ b/src/diffusers/models/attention_processor.py
+@@ -1,6 +1,7 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++from typing import Optional
+ 
+ class QwenImageAttnProcessor2_0:
+     r"""
+@@ -18,6 +19,13 @@ class QwenImageAttnProcessor2_0:
+         self,
+         attn,
+         hidden_states: torch.FloatTensor,
++        encoder_hidden_states: Optional[torch.FloatTensor] = None,
++        attention_mask: Optional[torch.FloatTensor] = None,
++        temb: Optional[torch.FloatTensor] = None,
++        *args,
++        **kwargs,
++    ) -> torch.FloatTensor:
++        # Get layer index for adaptive scaling
++        layer_idx = getattr(attn, '_qwen_layer_idx', 0)
+         
+         residual = hidden_states
+         batch_size, sequence_length, _ = hidden_states.shape
+@@ -32,17 +40,26 @@ class QwenImageAttnProcessor2_0:
+         else:
+             encoder_hidden_states = hidden_states
+ 
+-        # Get query, key, value
+-        query = attn.to_q(hidden_states)
+-        key = attn.to_k(encoder_hidden_states)
+-        value = attn.to_v(encoder_hidden_states)
++        # Apply input scaling for QKV (scale down by 8x for FP16 stability)
++        qkv_input_scale = 8.0 if hidden_states.dtype == torch.float16 else 1.0
++        
++        scaled_hidden_states = hidden_states / qkv_input_scale
++        scaled_encoder_hidden_states = encoder_hidden_states / qkv_input_scale
++        
++        # Get query, key, value with scaled inputs
++        query = attn.to_q(scaled_hidden_states)
++        key = attn.to_k(scaled_encoder_hidden_states)
++        value = attn.to_v(scaled_encoder_hidden_states)
+ 
+         inner_dim = key.shape[-1]
+         head_dim = inner_dim // attn.heads
+ 
+         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++        
++        # Scale back QKV to maintain proper magnitude
++        query = query * qkv_input_scale
++        key = key * qkv_input_scale
++        value = value * qkv_input_scale
+ 
+         # Attention
+         hidden_states = F.scaled_dot_product_attention(
+@@ -56,8 +73,16 @@ class QwenImageAttnProcessor2_0:
+         # Combine heads
+         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+ 
++        # Scale down attention output by 2x before projection for FP16 stability
++        attn_output_scale = 2.0 if hidden_states.dtype == torch.float16 else 1.0
++        hidden_states = hidden_states / attn_output_scale
++        
+         # Linear proj
+         hidden_states = attn.to_out[0](hidden_states)
++        
++        # Scale back up after projection to restore magnitude
++        hidden_states = hidden_states * attn_output_scale
++        
+         # Dropout
+         hidden_states = attn.to_out[1](hidden_states)
+ 
+@@ -65,3 +90,85 @@ class QwenImageAttnProcessor2_0:
+             hidden_states = attn.residual_connection(hidden_states)
+             hidden_states = hidden_states / attn.rescale_output_factor
+ 
++        return hidden_states
++
++
++--- a/src/diffusers/models/transformers/transformer_qwenimage.py
++++ b/src/diffusers/models/transformers/transformer_qwenimage.py
+@@ -1,6 +1,7 @@
+ import torch
+ import torch.nn as nn
+ from typing import Optional, Dict, Any
++import torch.nn.functional as F
+ 
+ 
+ class QwenImageTransformerBlock(nn.Module):
+@@ -15,6 +16,8 @@ class QwenImageTransformerBlock(nn.Module):
+         ...
+         super().__init__()
+         self.dim = dim
++        # Store layer index for adaptive scaling
++        self._layer_idx = 0
+         
+         # Components initialization
+         self.norm1 = nn.LayerNorm(dim, eps=eps)
+@@ -28,6 +31,66 @@ class QwenImageTransformerBlock(nn.Module):
+         temb: Optional[torch.FloatTensor] = None,
+         *args,
+         **kwargs,
++    ) -> torch.FloatTensor:
++        # Store original dtype
++        orig_dtype = hidden_states.dtype
++        is_fp16 = (orig_dtype == torch.float16)
++        
++        # Determine FFN scaling based on layer index
++        # Layers 0-58: 32x scaling, Layer 59: 512x scaling
++        if is_fp16:
++            if self._layer_idx >= 59:
++                ffn_scale = 512.0
++            else:
++                ffn_scale = 32.0
++        else:
++            ffn_scale = 1.0
++        
++        # Attention block
++        norm_hidden_states = self.norm1(hidden_states)
++        
++        # Process attention with scaled inputs
++        attn_output = self.attn(
++            norm_hidden_states,
++            encoder_hidden_states=encoder_hidden_states,
++            attention_mask=attention_mask,
++            **kwargs,
++        )
++        
++        # Add residual connection
++        hidden_states = hidden_states + attn_output
++        
++        # FFN block with aggressive scaling for FP16
++        norm_hidden_states = self.norm2(hidden_states)
++        
++        if is_fp16:
++            # Scale down input to FFN
++            norm_hidden_states = norm_hidden_states / ffn_scale
++        
++        # FFN forward pass
++        if hasattr(self, 'ff'):
++            ff_output = self.ff(norm_hidden_states)
++        elif hasattr(self, 'feed_forward'):
++            ff_output = self.feed_forward(norm_hidden_states)
++        else:
++            # Fallback: manual FFN
++            ff_output = self.ff_net(norm_hidden_states)
++        
++        if is_fp16:
++            # Scale back up after FFN
++            ff_output = ff_output * ffn_scale
++        
++        # Add residual connection
++        hidden_states = hidden_states + ff_output
++        
++        return hidden_states
++
++
++class QwenImageTransformer2DModel(nn.Module):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        
++        # After blocks are initialized, set layer indices
++        if hasattr(self, 'transformer_blocks'):
++            for idx, block in enumerate(self.transformer_blocks):
++                block._layer_idx = idx
++                # Also set on attention processor if it exists
++                if hasattr(block, 'attn'):
++                    block.attn._qwen_layer_idx = idx
++        elif hasattr(self, 'blocks'):
++            for idx, block in enumerate(self.blocks):
++                block._layer_idx = idx
++                if hasattr(block, 'attn'):
++                    block.attn._qwen_layer_idx = idx

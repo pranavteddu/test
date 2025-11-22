@@ -1,0 +1,153 @@
+diff --git a/src/diffusers/models/attention.py b/src/diffusers/models/attention.py
+index 1234567..abcdefg 100644
+--- a/src/diffusers/models/attention.py
++++ b/src/diffusers/models/attention.py
+@@ -100,6 +100,10 @@ class Attention(nn.Module):
+         self.norm_q = norm_layer(dim_head, eps=norm_eps) if norm_q else None
+         self.norm_k = norm_layer(dim_head, eps=norm_eps) if norm_k else None
+         
++        # Add layer index for FP16 scaling (will be set by transformer)
++        self._qwen_layer_idx = 0
++        self._qwen_fp16_scaling = False
++        
+         # For attention masking
+         self._attention_mask = None
+ 
+diff --git a/src/diffusers/models/attention_processor.py b/src/diffusers/models/attention_processor.py
+index 1234567..abcdefg 100644
+--- a/src/diffusers/models/attention_processor.py
++++ b/src/diffusers/models/attention_processor.py
+@@ -2000,6 +2000,12 @@ class AttnProcessor2_0:
+         query = attn.to_q(hidden_states)
+         
+         if encoder_hidden_states is None:
+             encoder_hidden_states = hidden_states
++        
++        # Apply FP16 scaling for Qwen-Image if enabled
++        is_fp16 = hidden_states.dtype == torch.float16
++        qkv_scale = 8.0 if (is_fp16 and getattr(attn, '_qwen_fp16_scaling', False)) else 1.0
++        attn_out_scale = 2.0 if (is_fp16 and getattr(attn, '_qwen_fp16_scaling', False)) else 1.0
++        
+         elif attn.norm_cross:
+             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+ 
+@@ -2007,8 +2013,17 @@ class AttnProcessor2_0:
+             query = attn.norm_q(query)
+         
+-        key = attn.to_k(encoder_hidden_states)
+-        value = attn.to_v(encoder_hidden_states)
++        # Scale inputs for QKV projection (Qwen FP16 optimization)
++        if qkv_scale != 1.0:
++            scaled_hidden = hidden_states / qkv_scale
++            scaled_encoder = encoder_hidden_states / qkv_scale
++            query = attn.to_q(scaled_hidden) * qkv_scale
++            key = attn.to_k(scaled_encoder) * qkv_scale  
++            value = attn.to_v(scaled_encoder) * qkv_scale
++        else:
++            query = attn.to_q(hidden_states)
++            key = attn.to_k(encoder_hidden_states)
++            value = attn.to_v(encoder_hidden_states)
+ 
+         if attn.norm_k is not None:
+             key = attn.norm_k(key)
+@@ -2034,7 +2049,14 @@ class AttnProcessor2_0:
+         # linear proj
+         hidden_states = hidden_states.to(query.dtype)
+-        hidden_states = attn.to_out[0](hidden_states)
++        
++        # Scale attention output (Qwen FP16 optimization)
++        if attn_out_scale != 1.0:
++            hidden_states = hidden_states / attn_out_scale
++            hidden_states = attn.to_out[0](hidden_states)
++            hidden_states = hidden_states * attn_out_scale
++        else:
++            hidden_states = attn.to_out[0](hidden_states)
++        
+         # dropout
+         hidden_states = attn.to_out[1](hidden_states)
+ 
+diff --git a/src/diffusers/models/transformers/transformer_qwenimage.py b/src/diffusers/models/transformers/transformer_qwenimage.py
+index 1234567..abcdefg 100644
+--- a/src/diffusers/models/transformers/transformer_qwenimage.py
++++ b/src/diffusers/models/transformers/transformer_qwenimage.py
+@@ -50,6 +50,7 @@ class QwenImageTransformerBlock(nn.Module):
+         self.attn = Attention(...)
+         self.ff = FeedForward(...)
+         
++        self._layer_idx = 0  # Will be set by parent transformer
+         ...
+ 
+     def forward(
+@@ -61,6 +62,11 @@ class QwenImageTransformerBlock(nn.Module):
+         **kwargs,
+     ) -> torch.Tensor:
+         
++        # Determine FFN scaling for FP16
++        is_fp16 = hidden_states.dtype == torch.float16
++        ffn_scale = (512.0 if self._layer_idx >= 59 else 32.0) if is_fp16 else 1.0
++        
++        # === Attention block ===
+         # Normalization
+         if self.use_ada_layer_norm:
+             norm_hidden_states = self.norm1(hidden_states, temb)
+@@ -74,10 +80,20 @@ class QwenImageTransformerBlock(nn.Module):
+         
+         # Add residual
+         hidden_states = hidden_states + attn_output
+-        
++
++        # === FFN block with FP16 scaling ===
+         # Normalization  
+         norm_hidden_states = self.norm2(hidden_states)
+         
++        # Scale down for FFN (Qwen FP16 optimization)
++        if ffn_scale != 1.0:
++            norm_hidden_states = norm_hidden_states / ffn_scale
++        
+         # Feed-forward
+         ff_output = self.ff(norm_hidden_states)
++        
++        # Scale back up (Qwen FP16 optimization)
++        if ffn_scale != 1.0:
++            ff_output = ff_output * ffn_scale
+         
+         # Add residual
+@@ -120,6 +136,20 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin):
+         
+         # Initialize blocks
+         self.transformer_blocks = nn.ModuleList([...])
++        
++    def enable_fp16_scaling(self):
++        """Enable FP16 activation scaling for stable inference."""
++        for idx, block in enumerate(self.transformer_blocks):
++            # Set layer index
++            block._layer_idx = idx
++            
++            # Enable FP16 scaling in attention
++            if hasattr(block, 'attn'):
++                block.attn._qwen_layer_idx = idx
++                block.attn._qwen_fp16_scaling = True
++            
++            # Adjust norm epsilon for scaled inputs (8x input scaling)
++            if hasattr(block, 'norm1') and hasattr(block.norm1, 'eps'):
++                block.norm1.eps = block.norm1.eps * 64  # 8^2
+ 
+     def forward(
+         self,
+diff --git a/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py b/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py
+index 1234567..abcdefg 100644
+--- a/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py
++++ b/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py
+@@ -200,6 +200,12 @@ class QwenImagePipeline(DiffusionPipeline):
+         
+         # Register modules
+         self.register_modules(...)
++        
++    def enable_fp16_scaling(self):
++        """Enable FP16 activation scaling for the transformer."""
++        if hasattr(self.transformer, 'enable_fp16_scaling'):
++            self.transformer.enable_fp16_scaling()
++            logger.info("FP16 activation scaling enabled for Qwen-Image pipeline")
+     
+     def encode_prompt(self, ...):
+         ...
