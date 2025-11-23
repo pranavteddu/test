@@ -1,37 +1,82 @@
 """
-Qwen-Image FP16 Auto-Calibration Tool
+Qwen-Image FP16 Direct Layer Scaling
 
-This script automatically finds the optimal scaling factors for each layer
-to prevent NaN overflow in FP16 inference.
+This approach directly modifies the Linear layers instead of wrapping processors,
+avoiding parameter signature issues.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List
 from diffusers import DiffusionPipeline
 import numpy as np
 import json
 from collections import defaultdict
-import inspect
+
+
+class ScaledLinear(nn.Module):
+    """
+    A Linear layer wrapper that applies input/output scaling for FP16 stability.
+    This directly replaces nn.Linear modules.
+    """
+    
+    def __init__(self, original_linear: nn.Linear, input_scale: float = 1.0, output_scale: float = 1.0):
+        super().__init__()
+        self.linear = original_linear
+        self.input_scale = input_scale
+        self.output_scale = output_scale
+        
+        # Copy attributes from original linear
+        self.in_features = original_linear.in_features
+        self.out_features = original_linear.out_features
+    
+    def forward(self, x):
+        is_fp16 = (x.dtype == torch.float16)
+        
+        if not is_fp16 or (self.input_scale == 1.0 and self.output_scale == 1.0):
+            return self.linear(x)
+        
+        # Scale down input
+        if self.input_scale != 1.0:
+            x = x / self.input_scale
+        
+        # Forward through linear
+        x = self.linear(x)
+        
+        # Scale output
+        if self.output_scale != 1.0:
+            x = x * self.output_scale
+        
+        # If we scaled input, scale output to compensate
+        if self.input_scale != 1.0:
+            x = x * self.input_scale
+        
+        if self.output_scale != 1.0:
+            x = x / self.output_scale
+        
+        return x
+    
+    def update_scales(self, input_scale: float = None, output_scale: float = None):
+        """Update scaling factors"""
+        if input_scale is not None:
+            self.input_scale = input_scale
+        if output_scale is not None:
+            self.output_scale = output_scale
 
 
 class ActivationMonitor:
-    """Monitors activations to detect overflow and track statistics"""
+    """Monitors activations to detect overflow"""
     
     def __init__(self):
         self.stats = defaultdict(lambda: {
             'max': 0.0,
-            'min': float('inf'),
             'has_nan': False,
             'has_inf': False,
-            'mean': 0.0,
-            'std': 0.0
         })
         self.hooks = []
     
     def register_hook(self, module, name):
-        """Register a forward hook to monitor activations"""
         def hook(module, input, output):
             if isinstance(output, tuple):
                 tensor = output[0]
@@ -40,24 +85,19 @@ class ActivationMonitor:
             
             if isinstance(tensor, torch.Tensor):
                 self.stats[name]['max'] = max(self.stats[name]['max'], tensor.abs().max().item())
-                self.stats[name]['min'] = min(self.stats[name]['min'], tensor.abs().min().item())
                 self.stats[name]['has_nan'] = self.stats[name]['has_nan'] or torch.isnan(tensor).any().item()
                 self.stats[name]['has_inf'] = self.stats[name]['has_inf'] or torch.isinf(tensor).any().item()
-                self.stats[name]['mean'] = tensor.abs().mean().item()
-                self.stats[name]['std'] = tensor.std().item()
         
         handle = module.register_forward_hook(hook)
         self.hooks.append(handle)
         return handle
     
     def clear_hooks(self):
-        """Remove all hooks"""
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
     
     def get_problematic_layers(self, threshold=65000):
-        """Return layers with activations exceeding FP16 range"""
         problematic = {}
         for name, stats in self.stats.items():
             if stats['has_nan'] or stats['has_inf'] or stats['max'] > threshold:
@@ -65,7 +105,6 @@ class ActivationMonitor:
         return problematic
     
     def print_summary(self):
-        """Print activation statistics summary"""
         print("\n" + "="*80)
         print("ACTIVATION STATISTICS")
         print("="*80)
@@ -79,130 +118,28 @@ class ActivationMonitor:
             elif stats['max'] > 65000:
                 status = "⚠ Overflow"
             
-            print(f"{status} {name:50s} | Max: {stats['max']:12.2f} | Mean: {stats['mean']:10.2f} | NaN: {stats['has_nan']}")
-
-
-class AdaptiveScaledAttentionWrapper:
-    """Attention wrapper with configurable per-layer scaling that handles all Qwen parameters"""
-    
-    def __init__(self, original_processor, layer_idx: int, 
-                 qkv_scale: float = 1.0, out_scale: float = 1.0):
-        self.original_processor = original_processor
-        self.layer_idx = layer_idx
-        self.qkv_scale = qkv_scale
-        self.out_scale = out_scale
-        
-        # Get the signature of the original processor to handle all parameters
-        if hasattr(original_processor, '__call__'):
-            self.processor_signature = inspect.signature(original_processor.__call__)
-        else:
-            self.processor_signature = None
-    
-    def update_scales(self, qkv_scale: float = None, out_scale: float = None):
-        """Update scaling factors"""
-        if qkv_scale is not None:
-            self.qkv_scale = qkv_scale
-        if out_scale is not None:
-            self.out_scale = out_scale
-    
-    def __call__(self, attn, hidden_states, *args, **kwargs):
-        """
-        Forward pass with scaling. Accepts any arguments that the original processor accepts.
-        """
-        
-        is_fp16 = (hidden_states.dtype == torch.float16)
-        
-        # If not FP16 or no scaling needed, pass through
-        if not is_fp16 or (self.qkv_scale == 1.0 and self.out_scale == 1.0):
-            return self.original_processor(attn, hidden_states, *args, **kwargs)
-        
-        # Store original projections
-        original_to_q = attn.to_q
-        original_to_k = attn.to_k
-        original_to_v = attn.to_v
-        original_to_out_0 = attn.to_out[0]
-        
-        # Create scaled versions
-        if self.qkv_scale != 1.0:
-            def scaled_to_q(x):
-                return original_to_q(x / self.qkv_scale) * self.qkv_scale
-            
-            def scaled_to_k(x):
-                return original_to_k(x / self.qkv_scale) * self.qkv_scale
-            
-            def scaled_to_v(x):
-                return original_to_v(x / self.qkv_scale) * self.qkv_scale
-            
-            attn.to_q = scaled_to_q
-            attn.to_k = scaled_to_k
-            attn.to_v = scaled_to_v
-        
-        if self.out_scale != 1.0:
-            def scaled_to_out(x):
-                return original_to_out_0(x / self.out_scale) * self.out_scale
-            
-            attn.to_out[0] = scaled_to_out
-        
-        # Call original processor with all arguments
-        try:
-            result = self.original_processor(attn, hidden_states, *args, **kwargs)
-        finally:
-            # Always restore original layers, even if there's an error
-            attn.to_q = original_to_q
-            attn.to_k = original_to_k
-            attn.to_v = original_to_v
-            attn.to_out[0] = original_to_out_0
-        
-        return result
-
-
-class AdaptiveScaledFFN(nn.Module):
-    """FFN wrapper with configurable scaling"""
-    
-    def __init__(self, original_ffn, layer_idx: int, scale: float = 1.0):
-        super().__init__()
-        self.ffn = original_ffn
-        self.layer_idx = layer_idx
-        self.scale = scale
-    
-    def update_scale(self, scale: float):
-        """Update scaling factor"""
-        self.scale = scale
-    
-    def forward(self, x, *args, **kwargs):
-        is_fp16 = (x.dtype == torch.float16)
-        scale = self.scale if is_fp16 else 1.0
-        
-        if scale == 1.0:
-            return self.ffn(x, *args, **kwargs)
-        
-        x = x / scale
-        x = self.ffn(x, *args, **kwargs)
-        x = x * scale
-        return x
+            print(f"{status} {name:60s} | Max: {stats['max']:12.2f}")
 
 
 class QwenFP16Calibrator:
-    """Automatic calibration tool for finding optimal FP16 scaling factors"""
+    """Calibrator that directly modifies Linear layers"""
     
     def __init__(self, pipe):
         self.pipe = pipe
         self.blocks = self._get_blocks()
         self.num_blocks = len(self.blocks)
         
-        # Default scaling factors (will be optimized)
+        # Track which layers have been modified
+        self.modified_layers = []
+        
+        # Scaling factors per block
         self.qkv_scales = [1.0] * self.num_blocks
         self.out_scales = [1.0] * self.num_blocks
         self.ffn_scales = [1.0] * self.num_blocks
         
-        # Installed wrappers
-        self.attn_wrappers = []
-        self.ffn_wrappers = []
-        
         print(f"Initialized calibrator with {self.num_blocks} transformer blocks")
     
     def _get_blocks(self):
-        """Get transformer blocks from pipeline"""
         transformer = self.pipe.transformer
         
         if hasattr(transformer, 'transformer_blocks'):
@@ -212,62 +149,84 @@ class QwenFP16Calibrator:
         else:
             raise ValueError("Could not find transformer blocks")
     
-    def install_adaptive_scaling(self):
-        """Install adaptive scaling wrappers on all blocks"""
-        print("\nInstalling adaptive scaling wrappers...")
+    def install_scaling_layers(self):
+        """Replace Linear layers with ScaledLinear in attention and FFN"""
+        print("\nInstalling scaled linear layers...")
         
         for idx, block in enumerate(self.blocks):
-            # Install attention wrapper
-            if hasattr(block, 'attn'):
-                try:
-                    # Get the original processor
-                    if hasattr(block.attn, 'processor'):
-                        original_processor = block.attn.processor
-                    else:
-                        # Try to get default processor
-                        try:
-                            original_processor = block.attn.get_processor()
-                        except:
-                            from diffusers.models.attention_processor import AttnProcessor2_0
-                            original_processor = AttnProcessor2_0()
-                    
-                    # Wrap it
-                    wrapper = AdaptiveScaledAttentionWrapper(
-                        original_processor, idx,
-                        self.qkv_scales[idx], self.out_scales[idx]
-                    )
-                    block.attn.processor = wrapper
-                    self.attn_wrappers.append(wrapper)
-                    print(f"  ✓ Installed attention wrapper on block {idx}")
-                except Exception as e:
-                    print(f"  ✗ Failed to install attention wrapper on block {idx}: {e}")
-                    self.attn_wrappers.append(None)
-            else:
-                self.attn_wrappers.append(None)
+            print(f"\nBlock {idx}:")
             
-            # Install FFN wrapper
-            ffn_installed = False
+            # Find and replace attention projection layers
+            if hasattr(block, 'attn'):
+                attn = block.attn
+                
+                # Replace to_q, to_k, to_v
+                for proj_name in ['to_q', 'to_k', 'to_v']:
+                    if hasattr(attn, proj_name):
+                        original = getattr(attn, proj_name)
+                        if isinstance(original, nn.Linear):
+                            scaled = ScaledLinear(original, self.qkv_scales[idx], 1.0)
+                            setattr(attn, proj_name, scaled)
+                            self.modified_layers.append((idx, f'attn.{proj_name}', scaled))
+                            print(f"  ✓ Replaced {proj_name}")
+                
+                # Replace to_out
+                if hasattr(attn, 'to_out'):
+                    if isinstance(attn.to_out, nn.ModuleList) or isinstance(attn.to_out, nn.Sequential):
+                        if len(attn.to_out) > 0 and isinstance(attn.to_out[0], nn.Linear):
+                            original = attn.to_out[0]
+                            scaled = ScaledLinear(original, self.out_scales[idx], 1.0)
+                            attn.to_out[0] = scaled
+                            self.modified_layers.append((idx, 'attn.to_out', scaled))
+                            print(f"  ✓ Replaced to_out")
+                    elif isinstance(attn.to_out, nn.Linear):
+                        original = attn.to_out
+                        scaled = ScaledLinear(original, self.out_scales[idx], 1.0)
+                        attn.to_out = scaled
+                        self.modified_layers.append((idx, 'attn.to_out', scaled))
+                        print(f"  ✓ Replaced to_out")
+            
+            # Find and replace FFN layers
+            ffn_found = False
             for attr_name in ['ff', 'feed_forward', 'ff_net', 'mlp']:
                 if hasattr(block, attr_name):
-                    try:
-                        original_ffn = getattr(block, attr_name)
-                        wrapper = AdaptiveScaledFFN(original_ffn, idx, self.ffn_scales[idx])
-                        setattr(block, attr_name, wrapper)
-                        self.ffn_wrappers.append(wrapper)
-                        print(f"  ✓ Installed FFN wrapper on block {idx} ({attr_name})")
-                        ffn_installed = True
+                    ffn = getattr(block, attr_name)
+                    
+                    # Look for linear layers in FFN
+                    if hasattr(ffn, 'net') and isinstance(ffn.net, nn.Sequential):
+                        for i, layer in enumerate(ffn.net):
+                            if isinstance(layer, nn.Linear) and i == 0:  # First linear layer
+                                original = layer
+                                scaled = ScaledLinear(original, self.ffn_scales[idx], 1.0)
+                                ffn.net[i] = scaled
+                                self.modified_layers.append((idx, f'{attr_name}.net[{i}]', scaled))
+                                print(f"  ✓ Replaced {attr_name}.net[{i}]")
+                                ffn_found = True
+                                break
+                    
+                    # Try direct linear layers
+                    if not ffn_found:
+                        for sub_attr in ['linear1', 'fc1', 'w1', 'c_fc']:
+                            if hasattr(ffn, sub_attr):
+                                original = getattr(ffn, sub_attr)
+                                if isinstance(original, nn.Linear):
+                                    scaled = ScaledLinear(original, self.ffn_scales[idx], 1.0)
+                                    setattr(ffn, sub_attr, scaled)
+                                    self.modified_layers.append((idx, f'{attr_name}.{sub_attr}', scaled))
+                                    print(f"  ✓ Replaced {attr_name}.{sub_attr}")
+                                    ffn_found = True
+                                    break
+                    
+                    if ffn_found:
                         break
-                    except Exception as e:
-                        print(f"  ✗ Failed to install FFN wrapper on block {idx}: {e}")
             
-            if not ffn_installed:
-                print(f"  ⚠ Could not find FFN in block {idx}")
-                self.ffn_wrappers.append(None)
+            if not ffn_found:
+                print(f"  ⚠ Could not find FFN linear layers")
         
-        print("\n✓ All wrappers installed\n")
+        print(f"\n✓ Installed {len(self.modified_layers)} scaled linear layers")
     
     def update_scales(self, qkv_scales=None, out_scales=None, ffn_scales=None):
-        """Update scaling factors for all layers"""
+        """Update scaling factors"""
         if qkv_scales is not None:
             self.qkv_scales = qkv_scales
         if out_scales is not None:
@@ -275,17 +234,17 @@ class QwenFP16Calibrator:
         if ffn_scales is not None:
             self.ffn_scales = ffn_scales
         
-        # Update wrappers
-        for idx, wrapper in enumerate(self.attn_wrappers):
-            if wrapper is not None:
-                wrapper.update_scales(self.qkv_scales[idx], self.out_scales[idx])
-        
-        for idx, wrapper in enumerate(self.ffn_wrappers):
-            if wrapper is not None:
-                wrapper.update_scale(self.ffn_scales[idx])
+        # Update all modified layers
+        for block_idx, layer_name, scaled_layer in self.modified_layers:
+            if 'to_q' in layer_name or 'to_k' in layer_name or 'to_v' in layer_name:
+                scaled_layer.update_scales(input_scale=self.qkv_scales[block_idx])
+            elif 'to_out' in layer_name:
+                scaled_layer.update_scales(input_scale=self.out_scales[block_idx])
+            elif any(x in layer_name for x in ['ff', 'feed_forward', 'mlp']):
+                scaled_layer.update_scales(input_scale=self.ffn_scales[block_idx])
     
     def test_generation(self, prompt="A simple test image", steps=10, width=512, height=512):
-        """Test generation and check for NaN values"""
+        """Test generation"""
         print(f"\nTesting generation (steps={steps}, size={width}x{height})...")
         
         try:
@@ -300,7 +259,6 @@ class QwenFP16Calibrator:
                     generator=torch.Generator(device=self.pipe.device).manual_seed(42)
                 ).images[0]
             
-            # Check for NaN
             img_array = np.array(image)
             has_nan = np.isnan(img_array).any()
             
@@ -308,36 +266,32 @@ class QwenFP16Calibrator:
                 print("✗ Output contains NaN values")
                 return False, None
             else:
-                print("✓ Generation successful, no NaN values")
+                print("✓ Generation successful!")
                 return True, image
                 
         except Exception as e:
-            print(f"✗ Generation failed with error: {e}")
+            print(f"✗ Generation failed: {e}")
             import traceback
             traceback.print_exc()
             return False, None
     
     def monitor_activations(self, prompt="A test image", steps=5):
-        """Run generation with activation monitoring"""
+        """Monitor activations"""
         print("\nMonitoring activations...")
         
         monitor = ActivationMonitor()
         
-        # Register hooks on all blocks
         for idx, block in enumerate(self.blocks):
+            # Monitor attention output
             if hasattr(block, 'attn'):
                 monitor.register_hook(block.attn, f"block_{idx}_attn")
             
+            # Monitor FFN output
             for attr_name in ['ff', 'feed_forward', 'ff_net', 'mlp']:
                 if hasattr(block, attr_name):
-                    ffn_module = getattr(block, attr_name)
-                    # If it's wrapped, unwrap it for monitoring
-                    if isinstance(ffn_module, AdaptiveScaledFFN):
-                        ffn_module = ffn_module.ffn
-                    monitor.register_hook(ffn_module, f"block_{idx}_ffn")
+                    monitor.register_hook(getattr(block, attr_name), f"block_{idx}_ffn")
                     break
         
-        # Run generation
         try:
             with torch.no_grad():
                 _ = self.pipe(
@@ -350,162 +304,109 @@ class QwenFP16Calibrator:
                     generator=torch.Generator(device=self.pipe.device).manual_seed(42)
                 )
         except Exception as e:
-            print(f"Generation failed during monitoring: {e}")
+            print(f"Monitoring failed: {e}")
         
         monitor.clear_hooks()
         monitor.print_summary()
         
         return monitor
     
-    def auto_calibrate(self, test_prompt="A coffee shop with neon lights", 
+    def auto_calibrate(self, test_prompt="A coffee shop", 
                       initial_qkv=8.0, initial_out=2.0, initial_ffn=32.0,
                       max_iterations=10):
-        """
-        Automatically calibrate scaling factors to eliminate NaN values.
-        
-        Strategy:
-        1. Start with suggested scales from Draw Things blog
-        2. Monitor activations to find problematic layers
-        3. Increase scaling for problematic layers iteratively
-        4. Test generation after each adjustment
-        """
+        """Auto-calibrate scaling factors"""
         
         print("\n" + "="*80)
-        print("STARTING AUTO-CALIBRATION")
+        print("AUTO-CALIBRATION")
         print("="*80)
         
-        # Initialize with base scales
+        # Initialize scales
         self.qkv_scales = [initial_qkv] * self.num_blocks
         self.out_scales = [initial_out] * self.num_blocks
-        
-        # FFN scales: 32x for layers 0-58, 512x for layer 59
         self.ffn_scales = [initial_ffn if i < 59 else initial_ffn * 16 for i in range(self.num_blocks)]
         
         self.update_scales(self.qkv_scales, self.out_scales, self.ffn_scales)
         
-        print(f"\nInitial scales:")
-        print(f"  QKV: {initial_qkv}x")
-        print(f"  Attention Output: {initial_out}x")
-        print(f"  FFN: {initial_ffn}x (layers 0-58), {initial_ffn*16}x (layer 59+)")
+        print(f"\nInitial scales: QKV={initial_qkv}x, Out={initial_out}x, FFN={initial_ffn}x")
         
         for iteration in range(max_iterations):
             print(f"\n{'='*80}")
             print(f"ITERATION {iteration + 1}/{max_iterations}")
             print(f"{'='*80}")
             
-            # Test generation with smaller resolution first, then larger
+            # Progressive resolution testing
             if iteration < 3:
-                test_width, test_height = 512, 512
-                test_steps = 10
+                w, h, s = 512, 512, 10
             else:
-                test_width, test_height = 1024, 1024
-                test_steps = 20
+                w, h, s = 1024, 1024, 20
             
-            success, image = self.test_generation(test_prompt, steps=test_steps, 
-                                                  width=test_width, height=test_height)
+            success, image = self.test_generation(test_prompt, steps=s, width=w, height=h)
             
-            if success and iteration >= 3:  # Only declare success after testing larger resolution
-                print(f"\n✓✓✓ CALIBRATION SUCCESSFUL ✓✓✓")
-                print(f"\nFinal scaling factors:")
+            if success and iteration >= 3:
+                print(f"\n✓✓✓ SUCCESS ✓✓✓")
                 self.print_scale_config()
                 return True, image
             elif success:
-                print(f"✓ Succeeded at {test_width}x{test_height}, testing larger resolution...")
+                print(f"✓ Success at {w}x{h}, testing larger...")
                 continue
             
-            # Monitor activations to find problematic layers
+            # Analyze failures
             print("\nAnalyzing problematic layers...")
             monitor = self.monitor_activations(test_prompt, steps=5)
             problematic = monitor.get_problematic_layers(threshold=60000)
             
             if not problematic:
-                print("No problematic layers detected, but generation still failed.")
-                print("Increasing all scales by 2x...")
+                print("No specific problematic layers, increasing all scales by 2x")
                 self.qkv_scales = [s * 2 for s in self.qkv_scales]
                 self.out_scales = [s * 2 for s in self.out_scales]
                 self.ffn_scales = [s * 2 for s in self.ffn_scales]
             else:
-                print(f"\nFound {len(problematic)} problematic layer(s)")
-                
-                # Extract layer indices and increase their scales
+                print(f"Found {len(problematic)} problematic layers")
                 for name, stats in problematic.items():
                     if 'block_' in name:
                         try:
                             layer_idx = int(name.split('_')[1])
-                            
                             if 'attn' in name:
                                 self.qkv_scales[layer_idx] *= 2
                                 self.out_scales[layer_idx] *= 2
-                                print(f"  Increased QKV/Out scales for layer {layer_idx}: "
-                                      f"QKV={self.qkv_scales[layer_idx]}x, Out={self.out_scales[layer_idx]}x")
-                            
+                                print(f"  Increased scales for block {layer_idx} attention")
                             if 'ffn' in name:
                                 self.ffn_scales[layer_idx] *= 2
-                                print(f"  Increased FFN scale for layer {layer_idx}: "
-                                      f"{self.ffn_scales[layer_idx]}x")
-                        except Exception as e:
-                            print(f"  Error parsing layer from {name}: {e}")
+                                print(f"  Increased scales for block {layer_idx} FFN")
+                        except:
+                            pass
             
-            # Update wrappers with new scales
             self.update_scales(self.qkv_scales, self.out_scales, self.ffn_scales)
         
-        print(f"\n✗ Calibration did not converge after {max_iterations} iterations")
-        print("\nCurrent scaling factors:")
+        print(f"\n✗ Did not converge after {max_iterations} iterations")
         self.print_scale_config()
         return False, None
     
     def print_scale_config(self):
-        """Print current scaling configuration"""
         print("\n" + "-"*80)
         print("SCALING CONFIGURATION")
         print("-"*80)
-        
         for idx in range(self.num_blocks):
-            qkv = self.qkv_scales[idx]
-            out = self.out_scales[idx]
-            ffn = self.ffn_scales[idx]
-            
-            marker = " ⚠" if (qkv > 64 or out > 64 or ffn > 512) else ""
-            print(f"Block {idx:2d}: QKV={qkv:6.1f}x  Out={out:6.1f}x  FFN={ffn:6.1f}x{marker}")
-        
+            print(f"Block {idx:2d}: QKV={self.qkv_scales[idx]:6.1f}x  "
+                  f"Out={self.out_scales[idx]:6.1f}x  FFN={self.ffn_scales[idx]:6.1f}x")
         print("-"*80)
     
     def save_config(self, filename="qwen_fp16_scales.json"):
-        """Save calibrated scales to file"""
         config = {
             'qkv_scales': self.qkv_scales,
             'out_scales': self.out_scales,
             'ffn_scales': self.ffn_scales,
-            'num_blocks': self.num_blocks
         }
-        
         with open(filename, 'w') as f:
             json.dump(config, f, indent=2)
-        
-        print(f"\n✓ Saved configuration to {filename}")
-    
-    def load_config(self, filename="qwen_fp16_scales.json"):
-        """Load scales from file"""
-        with open(filename, 'r') as f:
-            config = json.load(f)
-        
-        self.qkv_scales = config['qkv_scales']
-        self.out_scales = config['out_scales']
-        self.ffn_scales = config['ffn_scales']
-        
-        self.update_scales(self.qkv_scales, self.out_scales, self.ffn_scales)
-        
-        print(f"\n✓ Loaded configuration from {filename}")
-        self.print_scale_config()
+        print(f"\n✓ Saved to {filename}")
 
 
 def main():
-    """Example usage"""
-    
     model_name = "Qwen/Qwen-Image"
     
     print("="*80)
-    print("QWEN-IMAGE FP16 AUTO-CALIBRATION TOOL")
+    print("QWEN-IMAGE FP16 CALIBRATION (Direct Layer Scaling)")
     print("="*80)
     
     print("\nLoading model...")
@@ -516,24 +417,17 @@ def main():
     else:
         torch_dtype = torch.float32
         device = "cpu"
-        print("\n⚠ Warning: Running on CPU. Calibration may be very slow.")
     
     pipe = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch_dtype)
     pipe = pipe.to(device)
     
-    print(f"✓ Model loaded on {device} with dtype {torch_dtype}")
+    print(f"✓ Loaded on {device}")
     
-    # Create calibrator
     calibrator = QwenFP16Calibrator(pipe)
-    
-    # Install adaptive scaling
-    calibrator.install_adaptive_scaling()
-    
-    # Run auto-calibration
-    test_prompt = '''A coffee shop entrance with a chalkboard sign and neon lights'''
+    calibrator.install_scaling_layers()
     
     success, image = calibrator.auto_calibrate(
-        test_prompt=test_prompt,
+        test_prompt="A coffee shop with neon lights",
         initial_qkv=8.0,
         initial_out=2.0,
         initial_ffn=32.0,
@@ -542,22 +436,8 @@ def main():
     
     if success:
         image.save("calibrated_output.png")
-        print("\n✓ Test image saved as 'calibrated_output.png'")
-        
-        # Save configuration
         calibrator.save_config("qwen_fp16_scales.json")
-        
-        print("\n" + "="*80)
-        print("CALIBRATION COMPLETE!")
-        print("="*80)
-        print("\nYou can now use these scales for inference.")
-        print("The configuration has been saved to 'qwen_fp16_scales.json'")
-    else:
-        print("\n⚠ Calibration did not fully succeed.")
-        print("You may need to:")
-        print("  1. Increase max_iterations")
-        print("  2. Try higher initial scaling factors")
-        print("  3. Use BF16 instead of FP16 if your hardware supports it")
+        print("\n✓ COMPLETE! Image saved as 'calibrated_output.png'")
 
 
 if __name__ == "__main__":
